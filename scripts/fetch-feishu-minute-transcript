@@ -1,0 +1,134 @@
+#!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
+
+const DOMAIN = process.env.LARK_DOMAIN || 'https://open.feishu.cn';
+const minuteTokenPattern = /^[A-Za-z0-9]{24}$/u;
+const supportedFormats = new Set(['txt', 'srt']);
+
+function fail(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+function safeFeishuCode(payload) {
+  const code = payload?.code;
+  return (typeof code === 'number' || typeof code === 'string') && /^-?\d{1,12}$/u.test(String(code)) ? String(code) : 'unknown';
+}
+
+function safeHttpStatus(response) {
+  return Number.isInteger(response?.status) && response.status >= 100 && response.status <= 599 ? String(response.status) : 'unknown';
+}
+
+function minuteError(stage, response, payload) {
+  fail(`FEISHU_MINUTE_ERROR stage=${stage} feishu_code=${safeFeishuCode(payload)} http_status=${safeHttpStatus(response)}`);
+}
+
+function keychain(account, service) {
+  return execFileSync('security', ['find-generic-password', '-a', account, '-s', service, '-w'], {encoding: 'utf8'}).trim();
+}
+
+function storeToken(service, value) {
+  execFileSync('security', ['add-generic-password', '-U', '-a', 'codex', '-s', service, '-w', value]);
+}
+
+async function responsePayload(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function getUserAccessToken() {
+  let expiry;
+  try {
+    expiry = Number(keychain('codex', 'codex-feishu-v2-token-expiry'));
+    if (Number.isFinite(expiry) && expiry - Date.now() > 60_000) {
+      return keychain('codex', 'codex-feishu-v2-user-access-token');
+    }
+  } catch {
+    minuteError('credentials');
+  }
+
+  let appId;
+  let appSecret;
+  let refreshToken;
+  try {
+    appId = keychain('craigyu', 'codex-feishu-app-id');
+    appSecret = keychain('craigyu', 'codex-feishu-app-secret');
+    refreshToken = keychain('codex', 'codex-feishu-v2-refresh-token');
+  } catch {
+    minuteError('credentials');
+  }
+
+  let response;
+  let payload;
+  try {
+    response = await fetch(`${DOMAIN}/open-apis/authen/v2/oauth/token`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json; charset=utf-8'},
+      body: JSON.stringify({grant_type: 'refresh_token', client_id: appId, client_secret: appSecret, refresh_token: refreshToken}),
+    });
+    payload = await responsePayload(response);
+  } catch {
+    minuteError('token_acquisition');
+  }
+  if (!response.ok || payload?.code !== 0 || !payload?.access_token) minuteError('token_acquisition', response, payload);
+  try {
+    storeToken('codex-feishu-v2-user-access-token', payload.access_token);
+    if (payload.refresh_token) storeToken('codex-feishu-v2-refresh-token', payload.refresh_token);
+    storeToken('codex-feishu-v2-token-expiry', String(Date.now() + Number(payload.expires_in || 0) * 1000));
+  } catch {
+    minuteError('token_acquisition');
+  }
+  return payload.access_token;
+}
+
+function usage() {
+  fail('Usage: fetch-feishu-minute-transcript --minute-token <24_character_token> [--format txt|srt] [--need-speaker] [--need-timestamp]');
+}
+
+const parsed = {format: 'txt', needSpeaker: false, needTimestamp: false};
+const argv = process.argv.slice(2);
+for (let index = 0; index < argv.length; index += 1) {
+  const flag = argv[index];
+  if (flag === '--need-speaker') {
+    parsed.needSpeaker = true;
+    continue;
+  }
+  if (flag === '--need-timestamp') {
+    parsed.needTimestamp = true;
+    continue;
+  }
+  const value = argv[index + 1];
+  if ((flag !== '--minute-token' && flag !== '--format') || value === undefined) usage();
+  if (flag === '--minute-token') parsed.minuteToken = value;
+  if (flag === '--format') parsed.format = value;
+  index += 1;
+}
+
+if (typeof parsed.minuteToken !== 'string' || !minuteTokenPattern.test(parsed.minuteToken)) fail('minute_token must be a 24-character alphanumeric Minutes token');
+if (!supportedFormats.has(parsed.format)) fail('format must be txt or srt');
+
+try {
+  const userAccessToken = await getUserAccessToken();
+  const query = new URLSearchParams({file_format: parsed.format});
+  if (parsed.needSpeaker) query.set('need_speaker', 'true');
+  if (parsed.needTimestamp) query.set('need_timestamp', 'true');
+
+  let response;
+  try {
+    response = await fetch(`${DOMAIN}/open-apis/minutes/v1/minutes/${encodeURIComponent(parsed.minuteToken)}/transcript?${query}`, {
+      headers: {
+        Authorization: `Bearer ${userAccessToken}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+    });
+  } catch {
+    minuteError('transcript_read');
+  }
+  if (!response.ok) minuteError('transcript_read', response, await responsePayload(response));
+  process.stdout.write(await response.text());
+} catch {
+  minuteError('local_processing');
+}

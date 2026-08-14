@@ -1,0 +1,61 @@
+#!/bin/zsh
+set -euo pipefail
+
+domain="${LARK_DOMAIN:-https://open.feishu.cn}"
+
+usage() {
+  print 'Usage: feishu-bot-diagnostics'
+  print 'Returns a non-sensitive health summary for the installed Feishu app and bot. It never sends or changes data.'
+}
+
+fail() {
+  print -u2 -- "$1"
+  exit 1
+}
+
+(( $# == 0 )) || {
+  [[ "$1" == '--help' || "$1" == '-h' ]] && { usage; exit 0; }
+  fail "Unknown argument: $1"
+}
+command -v jq >/dev/null || fail 'jq is required to read the Feishu response safely'
+
+app_id="$(security find-generic-password -s codex-feishu-app-id -w)" || fail 'Feishu App ID is missing from macOS Keychain'
+app_secret="$(security find-generic-password -s codex-feishu-app-secret -w)" || fail 'Feishu App Secret is missing from macOS Keychain'
+
+token_response="$(curl --fail --silent --show-error \
+  --request POST "$domain/open-apis/auth/v3/tenant_access_token/internal" \
+  --header 'Content-Type: application/json; charset=utf-8' \
+  --data "{\"app_id\":\"$app_id\",\"app_secret\":\"$app_secret\"}")" \
+  || fail 'Could not obtain a Feishu application access token'
+token="$(print -r -- "$token_response" | jq -er '.tenant_access_token // empty')" \
+  || fail 'Feishu did not return an application access token'
+
+get_json() {
+  local endpoint="$1"
+  curl --fail --silent --show-error --header "Authorization: Bearer $token" "$domain$endpoint"
+}
+
+bot_info="$(get_json '/open-apis/bot/v3/info')" || fail 'Could not read Feishu bot status'
+scopes="$(get_json '/open-apis/contact/v3/scopes')" || fail 'Could not read Feishu application scope summary'
+chats="$(curl --fail --silent --show-error --get --header "Authorization: Bearer $token" \
+  --data-urlencode 'page_size=50' "$domain/open-apis/im/v1/chats")" || fail 'Could not read Feishu bot chat count'
+
+for response in "$bot_info" "$scopes" "$chats"; do
+  print -r -- "$response" | jq -e '(.code // 0) == 0' >/dev/null \
+    || fail 'Feishu rejected a bot diagnostics request'
+done
+
+app_name="$(print -r -- "$bot_info" | jq -r '[.. | objects | .app_name? // empty][0] // "unknown"')"
+activate_status="$(print -r -- "$bot_info" | jq -r '[.. | objects | .activate_status? // empty][0] // "unknown"')"
+department_count="$(print -r -- "$scopes" | jq '[.. | objects | .department_ids? // empty] | flatten | unique | length')"
+user_count="$(print -r -- "$scopes" | jq '[.. | objects | (.user_ids? // .open_ids? // empty)] | flatten | unique | length')"
+chat_count="$(print -r -- "$chats" | jq '[.. | objects | .items? // empty] | flatten | length')"
+
+jq -n \
+  --arg checked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg app_name "$app_name" \
+  --arg activate_status "$activate_status" \
+  --argjson department_count "$department_count" \
+  --argjson user_count "$user_count" \
+  --argjson chat_count "$chat_count" \
+  '{checked_at: $checked_at, app_name: $app_name, activate_status: $activate_status, department_count: $department_count, user_count: $user_count, bot_chat_count: $chat_count}'

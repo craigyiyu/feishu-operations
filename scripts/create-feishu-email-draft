@@ -1,0 +1,280 @@
+#!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
+import {lstat, readFile} from 'node:fs/promises';
+import {randomBytes} from 'node:crypto';
+import path from 'node:path';
+
+const DEFAULT_MAILBOX = 'craig.yu@hypervelocity.hk';
+const DOMAIN = process.env.LARK_DOMAIN || 'https://open.feishu.cn';
+const emailPattern = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
+const MAX_ATTACHMENT_COUNT = 10;
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const mimeByExtension = new Map([
+  ['.csv', 'text/csv'], ['.gif', 'image/gif'], ['.jpeg', 'image/jpeg'], ['.jpg', 'image/jpeg'],
+  ['.pdf', 'application/pdf'], ['.png', 'image/png'], ['.ppt', 'application/vnd.ms-powerpoint'],
+  ['.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'], ['.txt', 'text/plain'],
+  ['.xls', 'application/vnd.ms-excel'], ['.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+  ['.zip', 'application/zip'],
+]);
+
+function fail(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+function safeFeishuCode(payload) {
+  const code = payload?.code;
+  return (typeof code === 'number' || typeof code === 'string') && /^-?\d{1,12}$/.test(String(code)) ? String(code) : 'unknown';
+}
+
+function safeHttpStatus(response) {
+  return Number.isInteger(response?.status) && response.status >= 100 && response.status <= 599 ? String(response.status) : 'unknown';
+}
+
+function draftError(stage, response, payload) {
+  fail(`FEISHU_DRAFT_ERROR stage=${stage} feishu_code=${safeFeishuCode(payload)} http_status=${safeHttpStatus(response)}`);
+}
+
+async function responsePayload(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function usage() {
+  fail('Usage: create-feishu-email-draft --to-json <json_array> [--cc-json <json_array>] [--bcc-json <json_array>] [--attachment-paths-json <json_array>] --subject <subject> --body-plain-text <body> [--mailbox <mailbox>]');
+}
+
+function keychain(account, service) {
+  return execFileSync('security', ['find-generic-password', '-a', account, '-s', service, '-w'], {encoding: 'utf8'}).trim();
+}
+
+function storeToken(service, value) {
+  execFileSync('security', ['add-generic-password', '-U', '-a', 'codex', '-s', service, '-w', value]);
+}
+
+async function getUserAccessToken() {
+  const expiry = Number(keychain('codex', 'codex-feishu-v2-token-expiry'));
+  if (Number.isFinite(expiry) && expiry - Date.now() > 60_000) {
+    return keychain('codex', 'codex-feishu-v2-user-access-token');
+  }
+
+  let appId;
+  let appSecret;
+  let refreshToken;
+  try {
+    appId = keychain('craigyu', 'codex-feishu-app-id');
+    appSecret = keychain('craigyu', 'codex-feishu-app-secret');
+    refreshToken = keychain('codex', 'codex-feishu-v2-refresh-token');
+  } catch {
+    draftError('credentials');
+  }
+
+  let response;
+  let payload;
+  try {
+    response = await fetch(`${DOMAIN}/open-apis/authen/v2/oauth/token`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json; charset=utf-8'},
+      body: JSON.stringify({grant_type: 'refresh_token', client_id: appId, client_secret: appSecret, refresh_token: refreshToken}),
+    });
+    payload = await responsePayload(response);
+  } catch {
+    draftError('token_acquisition');
+  }
+  if (!response.ok || payload?.code !== 0 || !payload?.access_token) {
+    draftError('token_acquisition', response, payload);
+  }
+  try {
+    storeToken('codex-feishu-v2-user-access-token', payload.access_token);
+    if (payload.refresh_token) storeToken('codex-feishu-v2-refresh-token', payload.refresh_token);
+    storeToken('codex-feishu-v2-token-expiry', String(Date.now() + Number(payload.expires_in || 0) * 1000));
+  } catch {
+    draftError('token_acquisition');
+  }
+  return payload.access_token;
+}
+
+function parseAddressArray(label, value, required = false) {
+  if (value === undefined) {
+    if (required) fail(`${label} must contain at least one valid email address`);
+    return [];
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    fail(`${label} must be a JSON array of email addresses`);
+  }
+  if (!Array.isArray(parsed) || (required && parsed.length === 0) || parsed.length > 50) {
+    fail(`${label} must contain ${required ? 'at least one and at most 50' : 'at most 50'} valid email addresses`);
+  }
+  if (!parsed.every((address) => typeof address === 'string' && emailPattern.test(address) && !/[\r\n]/.test(address))) {
+    fail(`${label} must contain at least one valid email address`);
+  }
+  return parsed;
+}
+
+function encodeHeader(value) {
+  if (!/[^\x20-\x7e]/.test(value)) return value;
+  return `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`;
+}
+
+function wrapBase64(value) {
+  return value.match(/.{1,76}/g)?.join('\n') ?? '';
+}
+
+function encodeFilename(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+async function loadAttachments(value) {
+  if (value === undefined) return [];
+  let paths;
+  try {
+    paths = JSON.parse(value);
+  } catch {
+    fail('attachment_paths must be a JSON array of absolute file paths');
+  }
+  if (!Array.isArray(paths) || paths.length < 1 || paths.length > MAX_ATTACHMENT_COUNT) {
+    fail('attachment_paths must contain between 1 and 10 absolute file paths');
+  }
+  const resolvedPaths = paths.map((filePath) => typeof filePath === 'string' && path.isAbsolute(filePath) ? path.resolve(filePath) : null);
+  if (resolvedPaths.some((filePath) => !filePath) || new Set(resolvedPaths).size !== resolvedPaths.length) {
+    fail('attachment_paths must contain unique absolute file paths');
+  }
+  const attachments = [];
+  let totalBytes = 0;
+  for (const filePath of resolvedPaths) {
+    let metadata;
+    try {
+      metadata = await lstat(filePath);
+    } catch {
+      fail('Each attachment path must reference an existing regular file');
+    }
+    if (!metadata.isFile() || metadata.isSymbolicLink()) fail('Each attachment path must reference a regular non-symbolic-link file');
+    totalBytes += metadata.size;
+    if (totalBytes > MAX_ATTACHMENT_BYTES) fail('Total attachment size must not exceed 20 MiB');
+    let content;
+    try {
+      content = await readFile(filePath);
+    } catch {
+      fail('Each attachment file must be readable');
+    }
+    if (content.length !== metadata.size) fail('Attachment file changed while being read; try again');
+    const filename = path.basename(filePath);
+    attachments.push({
+      filename,
+      content,
+      contentType: mimeByExtension.get(path.extname(filename).toLowerCase()) ?? 'application/octet-stream',
+    });
+  }
+  return attachments;
+}
+
+function buildRawMessage({from, to, cc, bcc, subject, body, attachments}) {
+  const date = new Date();
+  const messageId = `${date.getTime()}.${randomBytes(12).toString('hex')}@larksuite-cli`;
+  const commonHeaders = [
+    `From: ${from}`,
+    `To: ${to.join(', ')}`,
+    ...(cc.length ? [`Cc: ${cc.join(', ')}`] : []),
+    ...(bcc.length ? [`Bcc: ${bcc.join(', ')}`] : []),
+    `Subject: ${encodeHeader(subject)}`,
+    'MIME-Version: 1.0',
+    `Date: ${date.toUTCString().replace('GMT', '+0000')}`,
+    `Message-ID: <${messageId}>`,
+  ];
+  const encodedBody = wrapBase64(Buffer.from(body, 'utf8').toString('base64'));
+  if (attachments.length === 0) {
+    const headers = [
+      ...commonHeaders,
+      'Content-Type: text/plain; charset=UTF-8',
+      'Content-Transfer-Encoding: base64',
+      '',
+      encodedBody,
+      '',
+    ];
+    return Buffer.from(headers.join('\n'), 'utf8').toString('base64url');
+  }
+  const boundary = `----=_FeishuDraft_${randomBytes(18).toString('hex')}`;
+  const headers = [
+    ...commonHeaders,
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    encodedBody,
+  ];
+  for (const attachment of attachments) {
+    const encodedFilename = encodeFilename(attachment.filename);
+    headers.push(
+      `--${boundary}`,
+      `Content-Type: ${attachment.contentType}; name*=UTF-8''${encodedFilename}`,
+      'Content-Transfer-Encoding: base64',
+      `Content-Disposition: attachment; filename*=UTF-8''${encodedFilename}`,
+      '',
+      wrapBase64(attachment.content.toString('base64')),
+    );
+  }
+  headers.push(`--${boundary}--`, '');
+  return Buffer.from(headers.join('\n'), 'utf8').toString('base64url');
+}
+
+const parsed = {mailbox: DEFAULT_MAILBOX};
+const argv = process.argv.slice(2);
+for (let index = 0; index < argv.length; index += 1) {
+  const flag = argv[index];
+  const value = argv[index + 1];
+  if (!['--mailbox', '--to-json', '--cc-json', '--bcc-json', '--attachment-paths-json', '--subject', '--body-plain-text'].includes(flag) || value === undefined) usage();
+  if (flag === '--mailbox') parsed.mailbox = value;
+  if (flag === '--to-json') parsed.toJson = value;
+  if (flag === '--cc-json') parsed.ccJson = value;
+  if (flag === '--bcc-json') parsed.bccJson = value;
+  if (flag === '--attachment-paths-json') parsed.attachmentPathsJson = value;
+  if (flag === '--subject') parsed.subject = value;
+  if (flag === '--body-plain-text') parsed.body = value;
+  index += 1;
+}
+
+if (!emailPattern.test(parsed.mailbox) || /[\r\n]/.test(parsed.mailbox)) fail('mailbox must be a valid email address');
+const to = parseAddressArray('to', parsed.toJson, true);
+const cc = parseAddressArray('cc', parsed.ccJson);
+const bcc = parseAddressArray('bcc', parsed.bccJson);
+if (typeof parsed.subject !== 'string' || !parsed.subject.trim() || /[\r\n]/.test(parsed.subject)) fail('subject must be a non-empty single-line string');
+if (typeof parsed.body !== 'string' || !parsed.body.trim()) fail('body_plain_text must be a non-empty string');
+const attachments = await loadAttachments(parsed.attachmentPathsJson);
+
+try {
+  const userAccessToken = await getUserAccessToken();
+
+  let response;
+  let payload;
+  try {
+    response = await fetch(`${DOMAIN}/open-apis/mail/v1/user_mailboxes/${encodeURIComponent(parsed.mailbox)}/drafts`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${userAccessToken}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({raw: buildRawMessage({from: parsed.mailbox, to, cc, bcc, subject: parsed.subject, body: parsed.body, attachments})}),
+    });
+    payload = await responsePayload(response);
+  } catch {
+    draftError('draft_create');
+  }
+  const draftId = payload?.data?.draft?.id;
+  if (!response.ok || payload?.code !== 0) {
+    draftError('draft_create', response, payload);
+  }
+  if (typeof draftId !== 'string' || !draftId) {
+    draftError('response_validation', response, payload);
+  }
+  process.stdout.write(`${JSON.stringify({status: 'draft_created', draft_id: draftId, attachment_count: attachments.length})}\n`);
+} catch {
+  draftError('local_processing');
+}

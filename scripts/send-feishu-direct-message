@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
+import path from 'node:path';
+
+const DOMAIN = process.env.LARK_DOMAIN || 'https://open.feishu.cn';
+const MAX_TEXT_LENGTH = 2000;
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+
+function fail(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+function safeFeishuCode(payload) {
+  const code = payload?.code;
+  return (typeof code === 'number' || typeof code === 'string') && /^-?\d{1,12}$/u.test(String(code)) ? String(code) : 'unknown';
+}
+
+function safeHttpStatus(response) {
+  return Number.isInteger(response?.status) && response.status >= 100 && response.status <= 599 ? String(response.status) : 'unknown';
+}
+
+function directMessageError(stage, response, payload) {
+  fail(`FEISHU_DIRECT_MESSAGE_ERROR stage=${stage} feishu_code=${safeFeishuCode(payload)} http_status=${safeHttpStatus(response)}`);
+}
+
+function keychain(service) {
+  return execFileSync('security', ['find-generic-password', '-a', 'craigyu', '-s', service, '-w'], {encoding: 'utf8'}).trim();
+}
+
+function parseArguments(argv) {
+  const parsed = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!['--recipient-name', '--text', '--confirmation'].includes(flag) || value === undefined || parsed[flag] !== undefined) {
+      fail('Usage: send-feishu-direct-message --recipient-name <exact_name> --text <plain_text> --confirmation send_direct_message');
+    }
+    parsed[flag] = value;
+    index += 1;
+  }
+  const recipientName = parsed['--recipient-name'];
+  const text = parsed['--text'];
+  if (typeof recipientName !== 'string' || !recipientName.trim() || /[\r\n]/u.test(recipientName) || recipientName.length > 255) {
+    fail('recipient_name must be a non-empty single-line name up to 255 characters');
+  }
+  if (typeof text !== 'string' || !text || text.length > MAX_TEXT_LENGTH) {
+    fail('text must contain between 1 and 2000 characters');
+  }
+  if (parsed['--confirmation'] !== 'send_direct_message') {
+    fail('confirmation must equal send_direct_message after Craig explicitly approves this exact message');
+  }
+  return {recipientName: recipientName.trim(), text};
+}
+
+async function responsePayload(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function getTenantAccessToken() {
+  let appId;
+  let appSecret;
+  try {
+    appId = keychain('codex-feishu-app-id');
+    appSecret = keychain('codex-feishu-app-secret');
+  } catch {
+    directMessageError('credentials');
+  }
+  let response;
+  let payload;
+  try {
+    response = await fetch(`${DOMAIN}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json; charset=utf-8'},
+      body: JSON.stringify({app_id: appId, app_secret: appSecret}),
+    });
+    payload = await responsePayload(response);
+  } catch {
+    directMessageError('token_acquisition');
+  }
+  if (!response.ok || payload?.code !== 0 || typeof payload?.tenant_access_token !== 'string' || !payload.tenant_access_token) {
+    directMessageError('token_acquisition', response, payload);
+  }
+  return payload.tenant_access_token;
+}
+
+function exactRecipient(recipientName) {
+  let stdout;
+  try {
+    stdout = execFileSync(path.join(scriptDir, 'fetch-feishu-company-directory'), ['--page-size', '500'], {encoding: 'utf8'});
+  } catch {
+    directMessageError('recipient_lookup');
+  }
+  let directory;
+  try {
+    directory = JSON.parse(stdout);
+  } catch {
+    directMessageError('recipient_lookup');
+  }
+  const matches = Array.isArray(directory?.employees)
+    ? directory.employees.filter((employee) => employee?.name === recipientName && typeof employee?.open_id === 'string' && employee.open_id)
+    : [];
+  if (matches.length !== 1) directMessageError('recipient_resolution');
+  return matches[0].open_id;
+}
+
+const {recipientName, text} = parseArguments(process.argv.slice(2));
+
+try {
+  const openId = exactRecipient(recipientName);
+  const token = await getTenantAccessToken();
+  const url = new URL(`${DOMAIN}/open-apis/im/v1/messages`);
+  url.searchParams.set('receive_id_type', 'open_id');
+  let response;
+  let payload;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({receive_id: openId, msg_type: 'text', content: JSON.stringify({text})}),
+    });
+    payload = await responsePayload(response);
+  } catch {
+    directMessageError('message_create');
+  }
+  if (!response.ok || payload?.code !== 0) directMessageError('message_create', response, payload);
+  process.stdout.write(`${JSON.stringify({recipient_name: recipientName, sent: true})}\n`);
+} catch {
+  directMessageError('local_processing');
+}

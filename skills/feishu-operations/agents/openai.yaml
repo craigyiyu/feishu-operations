@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu Operations"
+  short_description: "Operate Feishu mail and Bitable through the official MCP."
+  default_prompt: "Use Feishu to inspect mail or design a Bitable safely."

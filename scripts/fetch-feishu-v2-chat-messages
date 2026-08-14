@@ -1,0 +1,93 @@
+#!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
+
+function fail(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+function usage() {
+  fail('Usage: fetch-feishu-v2-chat-messages --chat-id <chat_id> [--page-size 1-50] [--start-time unix_seconds] [--end-time unix_seconds]');
+}
+
+function keychain(account, service) {
+  return execFileSync('security', ['find-generic-password', '-a', account, '-s', service, '-w'], {encoding: 'utf8'}).trim();
+}
+
+function storeToken(service, value) {
+  execFileSync('security', ['add-generic-password', '-U', '-a', 'codex', '-s', service, '-w', value]);
+}
+
+const parsed = {pageSize: 50};
+const argv = process.argv.slice(2);
+for (let index = 0; index < argv.length; index += 1) {
+  const flag = argv[index];
+  const value = argv[index + 1];
+  if (!['--chat-id', '--page-size', '--start-time', '--end-time'].includes(flag) || value === undefined) usage();
+  if (flag === '--chat-id') parsed.chatId = value;
+  if (flag === '--page-size') parsed.pageSize = Number(value);
+  if (flag === '--start-time') parsed.startTime = Number(value);
+  if (flag === '--end-time') parsed.endTime = Number(value);
+  index += 1;
+}
+
+if (!parsed.chatId?.trim()) usage();
+if (!Number.isInteger(parsed.pageSize) || parsed.pageSize < 1 || parsed.pageSize > 500) fail('page_size must be an integer between 1 and 500');
+for (const [label, value] of [['start_time', parsed.startTime], ['end_time', parsed.endTime]]) {
+  if (value !== undefined && (!Number.isInteger(value) || value < 0)) fail(`${label} must be a non-negative integer Unix timestamp`);
+}
+if (parsed.startTime !== undefined && parsed.endTime !== undefined && parsed.endTime < parsed.startTime) {
+  fail('end_time must be greater than or equal to start_time');
+}
+if (parsed.pageSize > 50 && (parsed.startTime === undefined || parsed.endTime === undefined)) {
+  fail('start_time and end_time are required when page_size exceeds 50');
+}
+
+async function getUserAccessToken() {
+  const expiry = Number(keychain('codex', 'codex-feishu-v2-token-expiry'));
+  if (Number.isFinite(expiry) && expiry - Date.now() > 60_000) {
+    return keychain('codex', 'codex-feishu-v2-user-access-token');
+  }
+
+  const appId = keychain('craigyu', 'codex-feishu-app-id');
+  const appSecret = keychain('craigyu', 'codex-feishu-app-secret');
+  const refreshToken = keychain('codex', 'codex-feishu-v2-refresh-token');
+  const response = await fetch('https://open.feishu.cn/open-apis/authen/v2/oauth/token', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json; charset=utf-8'},
+    body: JSON.stringify({grant_type: 'refresh_token', client_id: appId, client_secret: appSecret, refresh_token: refreshToken}),
+  });
+  const body = await response.json();
+  if (!response.ok || body.code !== 0 || !body.access_token) fail('Feishu user authorization refresh failed. Re-authorize the local Feishu bundle.');
+  storeToken('codex-feishu-v2-user-access-token', body.access_token);
+  if (body.refresh_token) storeToken('codex-feishu-v2-refresh-token', body.refresh_token);
+  storeToken('codex-feishu-v2-token-expiry', String(Date.now() + Number(body.expires_in || 0) * 1000));
+  return body.access_token;
+}
+
+try {
+  const token = await getUserAccessToken();
+  const items = [];
+  let nextPageToken;
+  let hasMore = false;
+  while (items.length < parsed.pageSize) {
+    const url = new URL('https://open.feishu.cn/open-apis/im/v1/messages');
+    url.searchParams.set('container_id_type', 'chat');
+    url.searchParams.set('container_id', parsed.chatId);
+    url.searchParams.set('page_size', String(Math.min(50, parsed.pageSize - items.length)));
+    if (parsed.startTime !== undefined) url.searchParams.set('start_time', String(parsed.startTime));
+    if (parsed.endTime !== undefined) url.searchParams.set('end_time', String(parsed.endTime));
+    if (nextPageToken) url.searchParams.set('page_token', nextPageToken);
+    const response = await fetch(url, {headers: {Authorization: `Bearer ${token}`}});
+    const body = await response.json();
+    if (!response.ok || body.code !== 0) fail(`Feishu chat-message read failed (code ${body.code ?? response.status}).`);
+    const data = body.data ?? {};
+    items.push(...(data.items ?? []));
+    hasMore = Boolean(data.has_more);
+    nextPageToken = data.page_token;
+    if (!hasMore || !nextPageToken) break;
+  }
+  process.stdout.write(`${JSON.stringify({items, has_more: hasMore, page_token: hasMore ? nextPageToken ?? null : null})}\n`);
+} catch (error) {
+  fail('Feishu v2 message helper could not complete. Check local authorization and the explicit chat ID.');
+}

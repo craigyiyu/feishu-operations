@@ -1,0 +1,23 @@
+{
+  "name": "feishu-operations",
+  "version": "0.1.0+codex.20260814090806",
+  "description": "Safely handle local Feishu mail, groups, documents, Wiki, Bitables, and Craig AI \u52a9\u7406 diagnostics through official APIs.",
+  "author": {
+    "name": "Craig Yu"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Feishu Operations",
+    "shortDescription": "Use Feishu safely from local Codex.",
+    "longDescription": "Connects local Codex to Craig's authorized Feishu app for mail analysis, group intelligence, documents, Wiki, Bitable work, and bot diagnostics.",
+    "developerName": "Craig Yu",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Interactive"
+    ],
+    "defaultPrompt": "Use Feishu locally to inspect mail, a group, a document, Wiki, or a Bitable safely."
+  },
+  "mcpServers": "./.mcp.json"
+}

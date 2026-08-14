@@ -1,0 +1,161 @@
+#!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
+import path from 'node:path';
+
+const DOMAIN = process.env.LARK_DOMAIN || 'https://open.feishu.cn';
+const MAX_TEXT_LENGTH = 2000;
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+
+function fail(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+function safeFeishuCode(payload) {
+  const code = payload?.code;
+  return (typeof code === 'number' || typeof code === 'string') && /^-?\d{1,12}$/u.test(String(code)) ? String(code) : 'unknown';
+}
+
+function safeHttpStatus(response) {
+  return Number.isInteger(response?.status) && response.status >= 100 && response.status <= 599 ? String(response.status) : 'unknown';
+}
+
+function userDirectMessageError(stage, response, payload) {
+  fail(`FEISHU_USER_DIRECT_MESSAGE_ERROR stage=${stage} feishu_code=${safeFeishuCode(payload)} http_status=${safeHttpStatus(response)}`);
+}
+
+function keychain(account, service) {
+  return execFileSync('security', ['find-generic-password', '-a', account, '-s', service, '-w'], {encoding: 'utf8'}).trim();
+}
+
+function storeToken(service, value) {
+  execFileSync('security', ['add-generic-password', '-U', '-a', 'codex', '-s', service, '-w', value]);
+}
+
+function parseArguments(argv) {
+  const parsed = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!['--recipient-name', '--text', '--confirmation'].includes(flag) || value === undefined || parsed[flag] !== undefined) {
+      fail('Usage: send-feishu-user-direct-message --recipient-name <exact_name> --text <plain_text> --confirmation send_user_direct_message');
+    }
+    parsed[flag] = value;
+    index += 1;
+  }
+  const recipientName = parsed['--recipient-name'];
+  const text = parsed['--text'];
+  if (typeof recipientName !== 'string' || !recipientName.trim() || /[\r\n]/u.test(recipientName) || recipientName.length > 255) {
+    fail('recipient_name must be a non-empty single-line name up to 255 characters');
+  }
+  if (typeof text !== 'string' || !text || text.length > MAX_TEXT_LENGTH) {
+    fail('text must contain between 1 and 2000 characters');
+  }
+  if (parsed['--confirmation'] !== 'send_user_direct_message') {
+    fail('confirmation must equal send_user_direct_message after Craig explicitly approves this exact message');
+  }
+  return {recipientName: recipientName.trim(), text};
+}
+
+async function responsePayload(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function getUserAccessToken() {
+  let expiry;
+  try {
+    expiry = Number(keychain('codex', 'codex-feishu-v2-token-expiry'));
+    if (Number.isFinite(expiry) && expiry - Date.now() > 60_000) {
+      return keychain('codex', 'codex-feishu-v2-user-access-token');
+    }
+  } catch {
+    userDirectMessageError('user_authorization');
+  }
+
+  let appId;
+  let appSecret;
+  let refreshToken;
+  try {
+    appId = keychain('craigyu', 'codex-feishu-app-id');
+    appSecret = keychain('craigyu', 'codex-feishu-app-secret');
+    refreshToken = keychain('codex', 'codex-feishu-v2-refresh-token');
+  } catch {
+    userDirectMessageError('user_authorization');
+  }
+  let response;
+  let payload;
+  try {
+    response = await fetch(`${DOMAIN}/open-apis/authen/v2/oauth/token`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json; charset=utf-8'},
+      body: JSON.stringify({grant_type: 'refresh_token', client_id: appId, client_secret: appSecret, refresh_token: refreshToken}),
+    });
+    payload = await responsePayload(response);
+  } catch {
+    userDirectMessageError('user_authorization');
+  }
+  if (!response.ok || payload?.code !== 0 || typeof payload?.access_token !== 'string' || !payload.access_token) {
+    userDirectMessageError('user_authorization', response, payload);
+  }
+  try {
+    storeToken('codex-feishu-v2-user-access-token', payload.access_token);
+    if (typeof payload.refresh_token === 'string' && payload.refresh_token) storeToken('codex-feishu-v2-refresh-token', payload.refresh_token);
+    storeToken('codex-feishu-v2-token-expiry', String(Date.now() + Number(payload.expires_in || 0) * 1000));
+  } catch {
+    userDirectMessageError('user_authorization');
+  }
+  return payload.access_token;
+}
+
+function exactRecipient(recipientName) {
+  let stdout;
+  try {
+    stdout = execFileSync(path.join(scriptDir, 'fetch-feishu-company-directory'), ['--page-size', '500'], {encoding: 'utf8'});
+  } catch {
+    userDirectMessageError('recipient_lookup');
+  }
+  let directory;
+  try {
+    directory = JSON.parse(stdout);
+  } catch {
+    userDirectMessageError('recipient_lookup');
+  }
+  const matches = Array.isArray(directory?.employees)
+    ? directory.employees.filter((employee) => employee?.name === recipientName && typeof employee?.open_id === 'string' && employee.open_id)
+    : [];
+  if (matches.length !== 1) userDirectMessageError('recipient_resolution');
+  return matches[0].open_id;
+}
+
+const {recipientName, text} = parseArguments(process.argv.slice(2));
+
+try {
+  const openId = exactRecipient(recipientName);
+  const token = await getUserAccessToken();
+  const url = new URL(`${DOMAIN}/open-apis/im/v1/messages`);
+  url.searchParams.set('receive_id_type', 'open_id');
+  let response;
+  let payload;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({receive_id: openId, msg_type: 'text', content: JSON.stringify({text})}),
+    });
+    payload = await responsePayload(response);
+  } catch {
+    userDirectMessageError('message_create');
+  }
+  if (!response.ok || payload?.code !== 0) userDirectMessageError('message_create', response, payload);
+  process.stdout.write(`${JSON.stringify({recipient_name: recipientName, sent: true})}\n`);
+} catch {
+  userDirectMessageError('local_processing');
+}

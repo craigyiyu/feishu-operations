@@ -1,0 +1,241 @@
+#!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
+
+const DOMAIN = process.env.LARK_DOMAIN || 'https://open.feishu.cn';
+const MAX_PAGE_SIZE = 500;
+const BATCH_SIZE = 50;
+const DEPARTMENT_PAGE_SIZE = 50;
+const MAX_DEPARTMENT_PAGES = 10;
+const TOKEN_PREFIX = 'directory-v1.';
+
+function fail(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+function safeFeishuCode(payload) {
+  const code = payload?.code;
+  return (typeof code === 'number' || typeof code === 'string') && /^-?\d{1,12}$/u.test(String(code)) ? String(code) : 'unknown';
+}
+
+function safeHttpStatus(response) {
+  return Number.isInteger(response?.status) && response.status >= 100 && response.status <= 599 ? String(response.status) : 'unknown';
+}
+
+function directoryError(stage, response, payload) {
+  fail(`FEISHU_DIRECTORY_ERROR stage=${stage} feishu_code=${safeFeishuCode(payload)} http_status=${safeHttpStatus(response)}`);
+}
+
+function keychain(service) {
+  return execFileSync('security', ['find-generic-password', '-a', 'craigyu', '-s', service, '-w'], {encoding: 'utf8'}).trim();
+}
+
+async function responsePayload(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function requestJson({token, path, params = [], stage}) {
+  const url = new URL(`${DOMAIN}${path}`);
+  for (const [key, value] of params) {
+    if (value !== undefined && value !== null && value !== '') url.searchParams.append(key, String(value));
+  }
+  let response;
+  let payload;
+  try {
+    response = await fetch(url, {headers: {Authorization: `Bearer ${token}`}});
+    payload = await responsePayload(response);
+  } catch {
+    directoryError(stage);
+  }
+  if (!response.ok || payload?.code !== 0) directoryError(stage, response, payload);
+  return payload.data ?? {};
+}
+
+async function getTenantAccessToken() {
+  let appId;
+  let appSecret;
+  try {
+    appId = keychain('codex-feishu-app-id');
+    appSecret = keychain('codex-feishu-app-secret');
+  } catch {
+    directoryError('credentials');
+  }
+  let response;
+  let payload;
+  try {
+    response = await fetch(`${DOMAIN}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json; charset=utf-8'},
+      body: JSON.stringify({app_id: appId, app_secret: appSecret}),
+    });
+    payload = await responsePayload(response);
+  } catch {
+    directoryError('token_acquisition');
+  }
+  if (!response.ok || payload?.code !== 0 || typeof payload?.tenant_access_token !== 'string' || !payload.tenant_access_token) {
+    directoryError('token_acquisition', response, payload);
+  }
+  return payload.tenant_access_token;
+}
+
+function nullableString(value) {
+  return typeof value === 'string' && value ? value : null;
+}
+
+function collectScopeIds(value, key, ids = new Set()) {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectScopeIds(entry, key, ids);
+  } else if (value && typeof value === 'object') {
+    const candidates = value[key];
+    if (Array.isArray(candidates)) {
+      for (const candidate of candidates) {
+        const id = nullableString(candidate);
+        if (id) ids.add(id);
+      }
+    }
+    for (const child of Object.values(value)) collectScopeIds(child, key, ids);
+  }
+  return ids;
+}
+
+function scopedIdentities(scopeData) {
+  const identityForScopeUserId = (id) => ({type: id.startsWith('ou_') ? 'open_id' : 'user_id', id});
+  const identities = [
+    ...[...collectScopeIds(scopeData, 'user_ids')].map(identityForScopeUserId),
+    ...[...collectScopeIds(scopeData, 'open_ids')].map((id) => ({type: 'open_id', id})),
+  ];
+  return identities.sort((left, right) => `${left.type}:${left.id}`.localeCompare(`${right.type}:${right.id}`));
+}
+
+function parseArguments(argv) {
+  const parsed = {pageSize: 100, offset: 0};
+  for (let index = 0; index < argv.length; index += 1) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if ((flag !== '--page-size' && flag !== '--page-token') || value === undefined) {
+      fail('Usage: fetch-feishu-company-directory [--page-size 1..500] [--page-token directory-v1.<offset>]');
+    }
+    if (flag === '--page-size') parsed.pageSize = Number(value);
+    if (flag === '--page-token') {
+      const match = /^directory-v1\.(0|[1-9]\d*)$/u.exec(value);
+      if (!match || !Number.isSafeInteger(Number(match[1]))) fail('page_token must be a directory continuation token');
+      parsed.offset = Number(match[1]);
+    }
+    index += 1;
+  }
+  if (!Number.isInteger(parsed.pageSize) || parsed.pageSize < 1 || parsed.pageSize > MAX_PAGE_SIZE) {
+    fail('page_size must be an integer between 1 and 500');
+  }
+  return parsed;
+}
+
+function isActive(record) {
+  return record?.status?.is_resigned !== true;
+}
+
+function projectEmployee(record) {
+  return {
+    name: nullableString(record?.name),
+    work_email: nullableString(record?.enterprise_email) ?? nullableString(record?.email),
+    user_id: nullableString(record?.user_id),
+    open_id: nullableString(record?.open_id),
+    employment_id: null,
+  };
+}
+
+async function resolvePage(token, identities) {
+  const records = [];
+  for (let index = 0; index < identities.length; index += BATCH_SIZE) {
+    const batch = identities.slice(index, index + BATCH_SIZE);
+    const firstType = batch[0]?.type;
+    if (!firstType) continue;
+    const sameType = batch.every((identity) => identity.type === firstType);
+    const groups = sameType ? [batch] : [batch.filter((identity) => identity.type === 'user_id'), batch.filter((identity) => identity.type === 'open_id')];
+    for (const group of groups) {
+      if (!group.length) continue;
+      const data = await requestJson({
+        token,
+        path: '/open-apis/contact/v3/users/batch',
+        params: [
+          ['user_id_type', group[0].type],
+          ['department_id_type', 'open_department_id'],
+          ...group.map((identity) => ['user_ids', identity.id]),
+        ],
+        stage: 'user_batch_read',
+      });
+      if (Array.isArray(data?.items)) records.push(...data.items);
+    }
+  }
+  const unique = new Map();
+  for (const record of records) {
+    const key = nullableString(record?.user_id) ?? nullableString(record?.open_id);
+    if (key && isActive(record)) unique.set(key, projectEmployee(record));
+  }
+  return [...unique.values()];
+}
+
+function departmentIdType(id) {
+  return id.startsWith('od-') ? 'open_department_id' : 'department_id';
+}
+
+async function resolveDepartmentMembers(token, departmentIds) {
+  const records = [];
+  for (const departmentId of departmentIds) {
+    let pageToken;
+    for (let page = 0; page < MAX_DEPARTMENT_PAGES; page += 1) {
+      const data = await requestJson({
+        token,
+        path: '/open-apis/contact/v3/users',
+        params: [
+          ['department_id', departmentId],
+          ['department_id_type', departmentIdType(departmentId)],
+          ['user_id_type', 'open_id'],
+          ['page_size', DEPARTMENT_PAGE_SIZE],
+          ['page_token', pageToken],
+        ],
+        stage: 'department_user_list',
+      });
+      if (Array.isArray(data?.items)) records.push(...data.items);
+      if (data?.has_more !== true) break;
+      pageToken = nullableString(data?.page_token);
+      if (!pageToken) directoryError('department_pagination');
+      if (page === MAX_DEPARTMENT_PAGES - 1) directoryError('department_pagination_limit');
+    }
+  }
+  return records.filter(isActive).map(projectEmployee);
+}
+
+function mergeEmployees(...lists) {
+  const unique = new Map();
+  for (const employee of lists.flat()) {
+    const key = employee.user_id ?? employee.open_id;
+    if (key) unique.set(key, employee);
+  }
+  return [...unique.values()].sort((left, right) => (left.user_id ?? left.open_id).localeCompare(right.user_id ?? right.open_id));
+}
+
+const {pageSize, offset} = parseArguments(process.argv.slice(2));
+
+try {
+  const token = await getTenantAccessToken();
+  const scopeData = await requestJson({token, path: '/open-apis/contact/v3/scopes', stage: 'scope_read'});
+  const identities = scopedIdentities(scopeData);
+  const departmentIds = [...collectScopeIds(scopeData, 'department_ids')].sort((left, right) => left.localeCompare(right));
+  const employees = mergeEmployees(
+    await resolvePage(token, identities),
+    await resolveDepartmentMembers(token, departmentIds),
+  );
+  const page = employees.slice(offset, offset + pageSize);
+  const nextOffset = offset + page.length;
+  process.stdout.write(`${JSON.stringify({
+    employees: page,
+    has_more: nextOffset < employees.length,
+    page_token: nextOffset < employees.length ? `${TOKEN_PREFIX}${nextOffset}` : null,
+  })}\n`);
+} catch {
+  directoryError('local_processing');
+}

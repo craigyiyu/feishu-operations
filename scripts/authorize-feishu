@@ -1,0 +1,15 @@
+#!/bin/zsh
+set -euo pipefail
+
+app_id="$(security find-generic-password -s codex-feishu-app-id -w)"
+app_secret="$(security find-generic-password -s codex-feishu-app-secret -w)"
+
+if [[ -z "$app_id" || -z "$app_secret" ]]; then
+  print -u2 "Feishu credentials are missing from macOS Keychain. Run scripts/store-feishu-credentials first."
+  exit 1
+fi
+
+exec npx -y @larksuiteoapi/lark-mcp login \
+  --app-id "$app_id" \
+  --app-secret "$app_secret" \
+  --domain "${LARK_DOMAIN:-https://open.feishu.cn}"

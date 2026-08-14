@@ -1,0 +1,35 @@
+#!/bin/zsh
+set -euo pipefail
+
+app_id="$(security find-generic-password -s codex-feishu-app-id -w)"
+app_secret="$(security find-generic-password -s codex-feishu-app-secret -w)"
+
+if [[ -z "$app_id" || -z "$app_secret" ]]; then
+  print -u2 "Feishu credentials are missing from macOS Keychain. Run scripts/store-feishu-credentials first."
+  exit 1
+fi
+
+# This list is deliberately fixed. Do not accept a caller-provided replacement:
+# the tenant token can access data beyond the interactive user's own resources.
+readonly_tools=(
+  corehr.v1.department.get
+  corehr.v1.department.list
+  corehr.v2.department.parents
+  corehr.v2.department.search
+  corehr.v2.department.tree
+  corehr.v2.employee.batchGet
+  corehr.v2.employee.search
+  corehr.v1.compensationStandard.match
+  payroll.v1.costAllocationDetail.list
+  payroll.v1.costAllocationPlan.list
+  payroll.v1.costAllocationReport.list
+  payroll.v1.datasource.list
+  payroll.v1.datasourceRecord.query
+)
+
+exec npx -y @larksuiteoapi/lark-mcp mcp \
+  --app-id "$app_id" \
+  --app-secret "$app_secret" \
+  --domain "${LARK_DOMAIN:-https://open.feishu.cn}" \
+  --token-mode tenant_access_token \
+  --tools "${(j:,:)readonly_tools}"

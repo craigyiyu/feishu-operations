@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "feishu": {
+      "command": "./scripts/launch-lark-mcp",
+      "args": [],
+      "cwd": ".",
+      "env_vars": ["LARK_DOMAIN"]
+    },
+    "feishu_local": {
+      "command": "./scripts/launch-feishu-local-mcp",
+      "args": [],
+      "cwd": ".",
+      "env_vars": ["LARK_DOMAIN"]
+    },
+    "feishu_tenant": {
+      "command": "./scripts/launch-lark-tenant-mcp",
+      "args": [],
+      "cwd": ".",
+      "env_vars": ["LARK_DOMAIN"]
+    }
+  }
+}

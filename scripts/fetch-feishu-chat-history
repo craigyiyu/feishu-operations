@@ -1,0 +1,83 @@
+#!/bin/zsh
+set -euo pipefail
+
+domain="${LARK_DOMAIN:-https://open.feishu.cn}"
+chat_id=""
+page_size=20
+page_token=""
+metadata_only=false
+
+usage() {
+  print 'Usage: fetch-feishu-chat-history --chat-id <chat_id> [--page-size 10..50] [--page-token <token>] [--metadata-only]'
+  print 'Reads one page of messages through the official Feishu OpenAPI. It never sends or changes messages.'
+}
+
+fail() {
+  print -u2 -- "$1"
+  exit 1
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --chat-id)
+      (( $# >= 2 )) || fail 'Missing value for --chat-id'
+      chat_id="$2"
+      shift 2
+      ;;
+    --page-size)
+      (( $# >= 2 )) || fail 'Missing value for --page-size'
+      page_size="$2"
+      shift 2
+      ;;
+    --page-token)
+      (( $# >= 2 )) || fail 'Missing value for --page-token'
+      page_token="$2"
+      shift 2
+      ;;
+    --metadata-only)
+      metadata_only=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "Unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$chat_id" ]] || { usage >&2; exit 1; }
+[[ "$page_size" == <-> ]] || fail 'Page size must be an integer between 10 and 50'
+(( page_size >= 10 && page_size <= 50 )) || fail 'Page size must be between 10 and 50'
+command -v jq >/dev/null || fail 'jq is required to read the Feishu response safely'
+
+app_id="$(security find-generic-password -s codex-feishu-app-id -w)" || fail 'Feishu App ID is missing from macOS Keychain'
+app_secret="$(security find-generic-password -s codex-feishu-app-secret -w)" || fail 'Feishu App Secret is missing from macOS Keychain'
+
+token_response="$(curl --fail --silent --show-error \
+  --request POST "$domain/open-apis/auth/v3/tenant_access_token/internal" \
+  --header 'Content-Type: application/json; charset=utf-8' \
+  --data "{\"app_id\":\"$app_id\",\"app_secret\":\"$app_secret\"}")" \
+  || fail 'Could not obtain a Feishu application access token'
+token="$(print -r -- "$token_response" | jq -er '.tenant_access_token // empty')" \
+  || fail 'Feishu did not return an application access token'
+
+curl_args=(--fail --silent --show-error --get
+  --header "Authorization: Bearer $token"
+  --data-urlencode 'container_id_type=chat'
+  --data-urlencode "container_id=$chat_id"
+  --data-urlencode "page_size=$page_size")
+[[ -n "$page_token" ]] && curl_args+=(--data-urlencode "page_token=$page_token")
+
+response="$(curl "${curl_args[@]}" "$domain/open-apis/im/v1/messages")" \
+  || fail 'Could not read Feishu chat history'
+print -r -- "$response" | jq -e '(.code // 0) == 0' >/dev/null \
+  || fail 'Feishu rejected the chat-history request'
+
+if [[ "$metadata_only" == true ]]; then
+  print -r -- "$response" | jq 'if .data.items then .data.items |= map(del(.body.content)) else . end'
+else
+  print -r -- "$response" | jq .
+fi

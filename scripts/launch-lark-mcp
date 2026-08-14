@@ -1,0 +1,46 @@
+#!/bin/zsh
+set -euo pipefail
+
+app_id="$(security find-generic-password -s codex-feishu-app-id -w)"
+app_secret="$(security find-generic-password -s codex-feishu-app-secret -w)"
+
+if [[ -z "$app_id" || -z "$app_secret" ]]; then
+  print -u2 "Feishu credentials are missing from macOS Keychain. Run scripts/store-feishu-credentials first."
+  exit 1
+fi
+
+args=(
+  -y
+  @larksuiteoapi/lark-mcp
+  mcp
+  --app-id "$app_id"
+  --app-secret "$app_secret"
+  --domain "${LARK_DOMAIN:-https://open.feishu.cn}"
+  --oauth
+  --token-mode user_access_token
+)
+
+official_tools=(
+  preset.default
+  preset.calendar.default
+  preset.task.default
+  calendar.v4.calendarEvent.list
+  calendar.v4.calendarEvent.delete
+  calendar.v4.calendarEventAttendee.create
+  calendar.v4.calendarEventAttendee.list
+  task.v2.task.get
+  task.v2.task.list
+  task.v2.task.delete
+  approval.v4.approval.get
+  approval.v4.instance.get
+  approval.v4.instance.list
+  approval.v4.instance.query
+  approval.v4.instanceComment.list
+  approval.v4.task.query
+  approval.v4.task.search
+  minutes.v1.minute.get
+)
+
+args+=(--tools "${(j:,:)official_tools}")
+
+exec npx "${args[@]}"
