@@ -4,8 +4,8 @@ This catalog is the working boundary for the `feishu-operations` bundle. “Veri
 
 | Area | Current local path | Status | Guardrail |
 | --- | --- | --- | --- |
-| Recent sent mail, inbox metadata, attachments | `feishu-mail-analysis` companion skill | Verified | Read smallest scope; email writes need exact approval. |
-| Mail-folder discovery and archived-folder metadata | `feishu-mail-analysis` companion helper: `--list-folders` | Verified, read-only | Call folder discovery first; select the returned folder ID in memory and use a separate, scoped message read. Do not guess from localized folder labels; pages are not guaranteed to be time-sorted. |
+| Recent sent mail, inbox metadata, attachments | Official `feishu` MCP mail reads; Tailscale `feishu-mail-analysis` companion for attachment analysis | Official reads pending user scopes; companion route verified | Read smallest scope; official user-token reads require `mail:user_mailbox.folder:read` and `mail:user_mailbox.message:read`; VPS attachment workflow uses Tailscale only. Email writes need exact approval. |
+| Mail-folder discovery and archived-folder metadata | Official MCP: `mail_v1_userMailboxFolder_list`; Tailscale companion helper: `--list-folders` | Official path pending user scopes; companion route verified, read-only | Call folder discovery first; select the returned folder ID in memory and use a separate, scoped message read. Do not guess from localized folder labels; pages are not guaranteed to be time-sorted. Never use public SSH. |
 | Create one unsent email draft, optionally with local attachments | Local MCP: `feishu_local.feishu_create_email_draft` | Verified, guarded | Craig must review and explicitly approve the exact recipient list, subject, body, and attachment names/sizes; tool requires `confirmation: "create_draft"`. Attachments are 1–10 explicit absolute regular-file paths, up to 20 MiB combined; no file is silently omitted. The helper constructs a Lark-compatible MIME message with an explicit `From` header and LF-only line endings, and calls the official draft-create endpoint with Craig's user access token. It cannot send, update, delete, reply, forward, archive, or change email status. Failures report only a safe stage, Feishu code, and HTTP status. |
 | Group discovery and members | Official MCP: `im_v1_chat_list`, `im_v1_chatMembers_get` | Verified | Inspect only groups relevant to Craig's request. |
 | Bot-accessible group history | Local MCP: `feishu_local.feishu_bot_group_history` | Verified | Use official group discovery first; bot must be a member; page size is 10–50; metadata-only by default. |
@@ -32,7 +32,7 @@ This catalog is the working boundary for the `feishu-operations` bundle. “Veri
 
 ## Normal routing
 
-- “What did I just send / which mail needs attention?” → mail-analysis companion skill.
+- “What did I just send / which mail needs attention?” → official mail MCP after user-scope authorization; otherwise the mail-analysis companion through the Tailscale wrapper.
 - “Which archived/custom-folder mail is this?” → discover folders first, then query the selected folder with a narrow time, sender, or subject filter.
 - “Create this reviewed email as a draft in my mailbox, with these local files attached.” → display the final email and every attachment filename/size, obtain explicit creation approval, then use `feishu_local.feishu_create_email_draft` with `attachment_paths`. Never use it to send.
 - “What are people discussing in this group?” → use official group discovery, then `feishu_local.feishu_bot_group_history` when the bot is a member.

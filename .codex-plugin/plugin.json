@@ -1,6 +1,6 @@
 {
   "name": "feishu-operations",
-  "version": "0.1.0+codex.20260814090806",
+  "version": "0.1.0+codex.20260820064133",
   "description": "Safely handle local Feishu mail, groups, documents, Wiki, Bitables, and Craig AI \u52a9\u7406 diagnostics through official APIs.",
   "author": {
     "name": "Craig Yu"

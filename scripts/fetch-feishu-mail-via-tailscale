@@ -1,0 +1,26 @@
+#!/bin/zsh
+set -euo pipefail
+
+target="${FEISHU_MAIL_VPS_TARGET:-ubuntu@bobvps}"
+fetch_script="${FEISHU_MAIL_FETCH_SCRIPT:-$HOME/.codex/skills/personal/feishu-mail-analysis/scripts/fetch_feishu_mail.py}"
+remote_env_path="${FEISHU_MAIL_ENV_PATH:-/home/hermes/.hermes/feishu-mail.env}"
+
+fail() {
+  print -u2 -- "$1"
+  exit 1
+}
+
+if [[ "$target" != *'@'* || "$target" == *$'\n'* || "$target" == *$'\r'* ]]; then
+  fail 'FEISHU_MAIL_VPS_TARGET must be a single-line Tailscale SSH target in the form user@MagicDNS-host'
+fi
+
+target_user="${target%%@*}"
+target_host="${target#*@}"
+if [[ -z "$target_user" || -z "$target_host" || "$target_user" == *[^A-Za-z0-9._-]* || "$target_host" == *[^A-Za-z0-9.-]* || "$target_host" == <->.<->.<->.<-> || "$target_host" == *:* ]]; then
+  fail 'FEISHU_MAIL_VPS_TARGET must be a single-line Tailscale SSH target in the form user@MagicDNS-host'
+fi
+
+[[ -f "$fetch_script" ]] || fail 'Feishu mail companion helper is unavailable locally. Reinstall feishu-mail-analysis.'
+command -v tailscale >/dev/null || fail 'Tailscale CLI is unavailable locally. Start or install Tailscale before running Feishu mail retrieval.'
+
+exec tailscale ssh "$target" sudo -n -u hermes env HOME=/home/hermes python3 -s - --env-path "$remote_env_path" "$@" < "$fetch_script"
